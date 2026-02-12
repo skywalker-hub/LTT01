@@ -63,7 +63,7 @@ pip install -r requirements.txt
 Prepare JSONL training data with the following format:
 
 ```json
-{"question": "...", "answer": "42", "reasoning_chain": "Step 1: ... Step 2: ..."}
+{"question": "...", "answer": "42", "reasoning_chain": "..."}
 ```
 
 Place your data files in the `data/` directory and update paths in the config file.
