@@ -1,9 +1,9 @@
 <div align="center">
 
-# Latent Thoughts Tuning
-
-### Bridging Context and Reasoning with Fused Information in Latent Tokens
-
+<div align="center">
+    <h1 align="center"> Latent Thoughts Tuning: Bridging Context and Reasoning with Fused Information in Latent Tokens
+    </h1>
+</div>
 [![arXiv](https://img.shields.io/badge/arXiv-2602.10229-b31b1b.svg)](https://arxiv.org/abs/2602.10229)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://www.python.org/)
@@ -17,12 +17,7 @@
 
 ## :sparkles: Overview
 
-**LT-Tuning** is a post-training framework that enables LLMs to reason in continuous latent space without external assistant models. Instead of verbalizing every intermediate step as text tokens (explicit CoT), our method allows models to dynamically interleave text and latent `<thinking>` tokens through **confidence-driven insertion** and **Context-Prediction Fusion**.
-
-<p align="center">
-  <img src="plots/fig1.pdf" width="70%" alt="Comparison of reasoning paradigms"/>
-</p>
-<!-- Replace with actual figure path (e.g., assets/fig1.png) -->
+**Latent Thoughts Tuning** (**LT-Tuning**) is a post-training framework that enables LLMs to reason in continuous latent space without external assistant models. Instead of verbalizing every intermediate step as text tokens (explicit CoT), our method allows models to dynamically interleave text and latent `<thinking>` tokens through **confidence-driven insertion** and **Context-Prediction Fusion**.
 
 ### :dart: Key Contributions
 
@@ -30,47 +25,11 @@
 - **Confidence-Driven Dynamic Switching** — Adaptively decides when to engage latent reasoning vs. explicit text generation based on prediction confidence.
 - **Three-Stage Curriculum Learning** — Progressively transitions from explicit CoT to latent reasoning for stable optimization.
 
----
-
-## :chart_with_upwards_trend: Results
-
-LT-Tuning achieves state-of-the-art performance across all model scales (1B / 3B / 8B) on mathematical reasoning benchmarks, trained on GSM8K and evaluated on four test sets.
-
-### Main Results
-
-| Model | Method | GSM8K-NL | ASDiv-Aug | MultiArith | SVAMP | Avg |
-|:------|:-------|:--------:|:---------:|:----------:|:-----:|:---:|
-| **Llama-3.2-1B** | Explicit CoT | 14.9 | 44.8 | 37.8 | 22.3 | 29.9 |
-| | Coconut | 14.6 | 42.5 | 22.8 | 21.0 | 25.2 |
-| | SoftCoT | 14.9 | **54.1** | 38.9 | 25.0 | 33.2 |
-| | **LT-Tuning (Ours)** | **15.8** | 53.9 | **51.7** | 24.3 | **36.4** |
-| **Llama-3.2-3B** | Explicit CoT | 29.5 | 69.8 | 57.2 | 45.7 | 50.5 |
-| | Coconut | 31.8 | 61.9 | 63.3 | 44.0 | 50.3 |
-| | **LT-Tuning (Ours)** | **32.1** | 67.2 | **64.4** | **45.7** | **52.4** |
-| **Llama-3.1-8B** | Explicit CoT | 49.5 | 69.6 | 78.3 | 49.3 | 61.7 |
-| | Soft-Thinking | 53.1 | 74.9 | 85.0 | 51.0 | 66.0 |
-| | Coconut | 32.7 | 38.8 | 51.7 | 43.0 | 41.5 |
-| | **LT-Tuning + Adapter (Ours)** | **58.5** | 70.7 | **96.1** | **55.7** | **70.3** |
-
-> LT-Tuning achieves up to **+4.3%** average improvement over the strongest baseline. Notably, Coconut degrades severely at 8B scale due to feature collapse, while LT-Tuning exhibits robust scaling.
-
-### Feature Collapse Mitigation
-
-<p align="center">
-  <img src="plots/pca_3d_positions_grid.pdf" width="80%" alt="PCA visualization of latent token embeddings"/>
-</p>
-<!-- Replace with actual figure path (e.g., assets/pca_visualization.png) -->
-
-PCA visualization of latent token embeddings on Llama-3.1-8B. **Coconut** (green) collapses after 2 steps; **LT-Tuning** (red) maintains semantic diversity across all reasoning steps.
-
----
-
 ## :building_construction: Method
 
 <p align="center">
-  <img src="plots/method_final.pdf" width="95%" alt="LT-Tuning Framework"/>
+  <img src="assets/method.png" width="96%" alt="LT-Tuning Framework"/>
 </p>
-<!-- Replace with actual figure path (e.g., assets/method.png) -->
 
 LT-Tuning uses a three-stage curriculum:
 
