@@ -1,9 +1,10 @@
 <div align="center">
-
-<div align="center">
     <h1 align="center"> Latent Thoughts Tuning: Bridging Context and Reasoning with Fused Information in Latent Tokens
     </h1>
 </div>
+
+<div align="center">
+
 [![arXiv](https://img.shields.io/badge/arXiv-2602.10229-b31b1b.svg)](https://arxiv.org/abs/2602.10229)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://www.python.org/)
