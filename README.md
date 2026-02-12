@@ -18,7 +18,7 @@
 
 ## :sparkles: Overview
 
-**Latent Thoughts Tuning** (**LT-Tuning**) is a post-training framework that enables LLMs to reason in continuous latent space without external assistant models. Instead of verbalizing every intermediate step as text tokens (explicit CoT), our method allows models to dynamically interleave text and latent `<thinking>` tokens through **confidence-driven insertion** and **Context-Prediction Fusion**.
+**Latent Thoughts Tuning** (**LT-Tuning**) is a post-training framework that enables LLMs to generate high-quality latent tokens for reasoning in continuous latent space without external assistant models. Instead of relying on a fixed number of latent tokens, our method allows models to dynamically interleave text and latent `<thinking>` tokens through **Confidence-driven Insertion** and **Context-Prediction Fusion**.
 
 ### :dart: Key Contributions
 
