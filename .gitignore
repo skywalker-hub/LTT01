@@ -32,7 +32,7 @@ saved_models/
 *.ckpt
 *.ckpt.index
 *.ckpt.meta
-
+*.tex
 # --- Environment & Dependencies ---
 venv/
 env/
