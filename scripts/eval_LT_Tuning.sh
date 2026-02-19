@@ -1,4 +1,4 @@
-CONFIG_FILE="configs/examle_config.yaml"
+CONFIG_FILE="configs/example_config.yaml"
 NUM_GPUS=4
 
 torchrun \
