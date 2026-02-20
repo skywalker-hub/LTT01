@@ -154,4 +154,5 @@ xgrammar==0.1.21
 xxhash==3.6.0
 yarl==1.22.0
 deepspeed==0.18.3
-flash_attn==2.7.2
+#flash_attn==2.7.2
+flash-attn~=2.7.2
