@@ -78,4 +78,6 @@ save_strategy: epoch
 eval_strategy: 'no'
 report_to: wandb
 seed: 42
+datasets:
+- MultiArith
 deepspeed: configs/ds_config_zero2.json
