@@ -274,7 +274,7 @@ def evaluate_single_dataset(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens,
-                without_thinking_token=True, # test_without thinking.
+                without_thinking_token=False, # test_without thinking.
             )
             
             # Decode output
