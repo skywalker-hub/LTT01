@@ -266,7 +266,10 @@ def evaluate_single_dataset(
             input_ids = tokenizer.encode(input_text, add_special_tokens=False, return_tensors="pt").to(device)
             attention_mask = torch.ones_like(input_ids)
             
-            # Generate
+            ## 【重要】生成时设置 without_thinking_token=True
+            ## 这意味着评测时禁用了 <thinking> 标记的生成！
+            ## 模型不会在推理时产生 <thinking> 潜在标记，而是直接生成文本
+            ## 即评测代码 没有 使用 <thinking> 进行辅助推理
             outputs = model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,

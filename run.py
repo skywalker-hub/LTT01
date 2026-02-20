@@ -167,7 +167,13 @@ def print_rank_0(msg: str):
 
 
 def load_model_and_tokenizer(custom_args: CustomizedArguments, training_args: LTTuningTrainingArguments) -> Tuple:
-    """Load base model and tokenizer, setup thinking token, wrap with LT_Tuning."""
+    """
+    加载基础模型和分词器，设置 <thinking> 标记，并包装为 LT_Tuning_Model。
+    关键步骤：
+      1. 加载预训练的因果语言模型（如 Llama-3.2-1B）
+      2. 将 <thinking> 标记添加到词表并初始化其嵌入
+      3. 用 LT_Tuning_Model 包装基础模型，支持三阶段潜在推理
+    """
     # Determine attention implementation and dtype
     attn_impl = "flash_attention_2" if custom_args.use_flash_attention else "eager"
     torch_dtype = torch.bfloat16 if training_args.bf16 else torch.float32
@@ -193,7 +199,9 @@ def load_model_and_tokenizer(custom_args: CustomizedArguments, training_args: LT
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
     
-    # Setup thinking token
+    ## 设置 <thinking> 标记：将其添加到词表中
+    ## <thinking> 标记在论文中是潜在推理的占位符，其嵌入不是静态的，
+    ## 而是由前一位置的隐藏状态动态生成
     if custom_args.use_unk_for_thinking:
         if tokenizer.unk_token_id is None:
             raise ValueError("Tokenizer has no unk_token but use_unk_for_thinking=True")
@@ -213,6 +221,9 @@ def load_model_and_tokenizer(custom_args: CustomizedArguments, training_args: LT
                 model.lm_head.weight.data[thinking_token_id] = model.lm_head.weight.data[ref_token_id].clone()
             print_rank_0(f"Added thinking token '{custom_args.thinking_token}' (id={thinking_token_id})")
     
+    ## 用 LT_Tuning_Model 包装基础模型，初始阶段为 "common"（阶段0：显式CoT预热）
+    ## hidden_state_layer_index: 论文中的第 I 层，用于提取 h_{t-1,I}
+    ## fusion_alpha/top_p/temperature: 阶段2的融合参数（公式6、7）
     lt_tuning_model = LT_Tuning_Model(
         base_causallm=model,
         thinking_token_id=thinking_token_id,
@@ -241,7 +252,16 @@ def load_model_and_tokenizer(custom_args: CustomizedArguments, training_args: LT
 # ==============================================================================
 
 class StageUpdateCallback(TrainerCallback):
-    """Callback to handle multi-stage training: update model config and regenerate datasets."""
+    """
+    【三阶段课程学习的核心回调】
+    在每个 epoch 开始时检查是否需要切换训练阶段：
+      - 阶段0→阶段1：从显式CoT切换到动态潜在标记生成
+      - 阶段1→阶段2：从隐藏状态嵌入切换到上下文-预测融合
+    切换时执行：
+      1. 更新模型的 stage_mode（common → hidden_state → soft_fusion）
+      2. 使用新的策略重新生成训练数据集（插入/不插入 <thinking>）
+      3. 可选的优化器状态转换
+    """
     
     def __init__(self, stage_manager, config, model, tokenizer, thinking_token_id,
                  train_dataset_raw, collator_factory, trainer_ref, debug_num=None,
@@ -268,16 +288,18 @@ class StageUpdateCallback(TrainerCallback):
         self.in_warmup = False
     
     def on_epoch_begin(self, args, state, control, **kwargs):
-        """Check for stage change at the beginning of each epoch."""
+        """在每个 epoch 开始时检查是否需要切换阶段，是论文渐进式课程学习的调度入口"""
         epoch = int(state.epoch) if state.epoch else 0
+        ## 检查当前 epoch 是否应该进入新阶段
         stage_changed = self.stage_manager.update_for_epoch(epoch)
         
         if stage_changed:
             print_rank_0(f"\n[Callback] Stage changed to: {self.stage_manager.describe()}")
+            ## 更新模型的阶段配置（stage_mode, fusion_alpha 等）
             self._update_model_config()
+            ## 重新生成训练数据集（使用新阶段的 <thinking> 插入策略）
             if DATA_UPDATE_MODE == 'on_stage_change':
                 self._regenerate_dataset()
-            # Apply optimizer transition strategy
             self._apply_optimizer_transition()
             self.last_stage_mode = self.stage_manager.current_mode
         return control
@@ -909,43 +931,50 @@ class LTTuningTrainer(Trainer):
 # ==============================================================================
 
 def main():
+    """
+    LT-Tuning 训练主函数。
+    整体流程：
+      1. 解析配置 → 2. 初始化阶段管理器(StageManager) → 3. 加载模型
+      → 4. 准备数据集 → 5. 创建回调(含阶段切换) → 6. 启动训练
+    训练过程通过 StageManager 管理三阶段课程学习：
+      阶段0 (common): 显式 CoT 推理预热（论文4.1节）
+      阶段1 (hidden_state): 动态潜在标记生成（论文4.2节）
+      阶段2 (soft_fusion): 上下文-预测融合（论文4.3节）
+    """
     parser = argparse.ArgumentParser(description="LT_Tuning Training")
     parser.add_argument("config_file", type=str, help="Path to YAML config file")
     parser.add_argument("--local_rank", type=int, default=-1, help="Local rank for distributed training (passed by DeepSpeed)")
     args = parser.parse_args()
     
-    # Parse arguments from YAML
+    ## =========== 第1部分：解析配置并初始化 ===========
     custom_args, training_args = parse_args_from_yaml(args.config_file)
     
-    # Pass local_rank from command line to training_args (for DeepSpeed)
     if args.local_rank != -1:
         training_args.local_rank = args.local_rank
     
-    # Set seed
     set_seed(training_args.seed)
-    
-    # Create output directory
     os.makedirs(training_args.output_dir, exist_ok=True)
     
-    # Setup wandb environment variables for better logging
     if not DEBUG and is_main_process():
         os.environ.setdefault("WANDB_PROJECT", custom_args.project)
-        os.environ.setdefault("WANDB_WATCH", "all")  # Log gradients and model topology
-        os.environ.setdefault("WANDB_LOG_MODEL", "false")  # Don't auto-upload model artifacts
+        os.environ.setdefault("WANDB_WATCH", "all")
+        os.environ.setdefault("WANDB_LOG_MODEL", "false")
         os.environ.setdefault("WANDB_NAME", custom_args.name)
     
-    # Convert to Config object for StageManager compatibility
     config = Config({**vars(custom_args), **{k: v for k, v in vars(training_args).items()}})
     
-    # Initialize StageManager
+    ## 初始化阶段管理器 StageManager —— 管理三阶段课程学习的核心组件
+    ## 根据 stage_epochs 配置决定每个阶段持续的 epoch 数，
+    ## 并在阶段切换时更新 insertion_prob、fusion_alpha 等参数
     stage_manager = StageManager(config)
     print_rank_0(f"Initialized StageManager: {stage_manager.describe()}")
     
-    # =========== Part 2: Load Model ===========
+    ## =========== 第2部分：加载模型 ===========
+    ## 加载基础因果语言模型 → 添加 <thinking> 标记 → 包装为 LT_Tuning_Model
     model, tokenizer, thinking_token_id = load_model_and_tokenizer(custom_args, training_args)
     print_rank_0(f"Model loaded: {type(model).__name__}, thinking_token_id={thinking_token_id}, dtype={next(model.parameters()).dtype}")
     
-    # Update model stage config from stage_manager
+    ## 根据当前阶段设置模型的 stage_mode（common/hidden_state/soft_fusion）
     model.update_stage_config(
         stage_mode=stage_manager.current_mode,
         fusion_alpha=config.fusion_alpha,
@@ -953,15 +982,17 @@ def main():
         fusion_temperature=config.fusion_temperature,
     )
     
-    # =========== Part 3: Load Datasets ===========
+    ## =========== 第3部分：准备数据集 ===========
     print_rank_0("Loading datasets...")
     
-    # Load raw datasets
+    ## 加载原始数据集（包含 question, reasoning_chain, answer）
     train_dataset_raw = get_dataset(custom_args.train_path, dataset_name="gsm8k")
     val_dataset_raw = get_dataset(custom_args.val_path, dataset_name="gsm8k")
     print_rank_0(f"Raw datasets loaded: train={len(train_dataset_raw)}, val={len(val_dataset_raw)}")
     
-    # Build thinking strategy (None for stage0/common mode)
+    ## 构建 <thinking> 插入策略
+    ## 阶段0 (common): strategy=None，不插入 <thinking>，纯 CoT 训练
+    ## 阶段1/2: 使用 ConfidenceThinkingStrategy，在低置信度位置插入 <thinking>
     thinking_strategy = None
     if stage_manager.current_mode != "common":
         thinking_strategy = build_thinking_strategy(
@@ -972,7 +1003,9 @@ def main():
         )
         print_rank_0(f"Built thinking strategy: {type(thinking_strategy).__name__}")
     
-    # Process training dataset with thinking tokens
+    ## 处理训练数据：对每个样本构建 CoT 文本，并根据策略插入 <thinking> 标记
+    ## 阶段0: 纯文本 CoT 序列
+    ## 阶段1/2: 在低置信度位置插入 <thinking> 的混合序列
     train_dataset = get_cot_latent_dataset(
         stage_type=stage_manager.current_mode,
         base_dataset=train_dataset_raw,
@@ -980,10 +1013,10 @@ def main():
         strategy=thinking_strategy,
         tokenizer=tokenizer,
         shuffle=True,
-        debug_num=100 if DEBUG else None,  # Limit samples in debug mode
+        debug_num=100 if DEBUG else None,
     )
     
-    # Process validation dataset (question only for generation)
+    ## 准备验证数据集（仅包含问题，用于生成式评测）
     val_dataset = get_question_dataset(
         stage_type=stage_manager.current_mode,
         base_dataset_valid=val_dataset_raw,
@@ -999,17 +1032,16 @@ def main():
         val_dataset.save_to_disk(os.path.join(dataset_dir, "val"))
         print_rank_0(f"Saved datasets to {dataset_dir}")
     
-    # Create data collator
+    ## 创建数据整理器（collator）：阶段0不需要特殊处理 <thinking>；阶段1/2需要对齐 <thinking> 位置
     data_collator = MyCollator(
         tokenizer=tokenizer,
         thinking_id=thinking_token_id if stage_manager.current_mode != "common" else None,
         label_pad_token_id=-100,
     )
     
-    # ================== WRAP WITH PROXIES ==================
-    # Wrap dataset and collator with dynamic proxies so they can be
-    # updated at runtime during stage changes without recreating DataLoader
-    # =========================================================
+    ## 使用动态代理包装数据集和整理器
+    ## 这样在阶段切换时可以替换底层数据集而无需重建 DataLoader
+    ## （HuggingFace Trainer 在训练开始时只创建一次 DataLoader）
     train_dataset = DynamicDatasetProxy(train_dataset)
     data_collator = DynamicCollatorProxy(data_collator)
     print_rank_0(f"Wrapped train_dataset with DynamicDatasetProxy and data_collator with DynamicCollatorProxy")
@@ -1037,10 +1069,13 @@ def main():
         print_rank_0(f"First sample labels: {tokenizer.decode(label_tokens[:30])}...")
         print_rank_0("===== End Debug =====\n")
     
-    # =========== Part 4: Callbacks ===========
-    trainer_ref = [None]  # Mutable container to pass trainer reference
+    ## =========== 第4部分：设置回调函数 ===========
+    ## StageUpdateCallback 是实现三阶段课程学习的关键：
+    ##   - 在每个 epoch 开始时检查是否需要切换阶段
+    ##   - 切换时更新模型的 stage_mode 和重新生成训练数据集
+    trainer_ref = [None]
     collator_factory = create_collator_factory(tokenizer, thinking_token_id)
-    debug_num = 100 if DEBUG else None  # Consistent limit for DEBUG mode
+    debug_num = 100 if DEBUG else None
     
     stage_callback = StageUpdateCallback(
         stage_manager=stage_manager,
@@ -1088,8 +1123,9 @@ def main():
     
     print_rank_0(f"Created {len(callbacks)} callbacks.")
     
-    # =========== Part 5: Training ===========
-    # Disable wandb and deepspeed in DEBUG mode
+    ## =========== 第5部分：启动训练 ===========
+    ## 使用自定义的 LTTuningTrainer（继承自 HuggingFace Trainer），
+    ## 通过 StageUpdateCallback 在 epoch 边界自动完成三阶段课程切换
     if DEBUG:
         training_args.report_to = []
         training_args.deepspeed = None  # Disable DeepSpeed in DEBUG mode

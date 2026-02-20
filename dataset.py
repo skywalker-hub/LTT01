@@ -27,14 +27,23 @@ def get_rank():
         return dist.get_rank()
     return 0
 class ThinkingTokenStrategy(ABC):
+    """
+    <thinking> 标记插入策略的抽象基类。
+    论文4.2节描述了基于置信度的动态标记插入机制，
+    本基类定义了所有策略共享的接口和辅助方法。
+    子类包括:
+      - RandomThinkingStrategy: 随机插入（基线方法）
+      - ArithmeticThinkingStrategy: 在数字/运算符位置插入
+      - ConfidenceThinkingStrategy: 基于模型预测置信度插入（对应论文公式5）
+    """
 
     def __init__(
         self,
         tokenizer: PreTrainedTokenizerBase,
         thinking_token_id: int,
-        tokens_per_stage: Union[float, int] = 1,
-        insertion_prob: float = 1.0,
-        secondary_insertion_prob: float = 0.0,
+        tokens_per_stage: Union[float, int] = 1,     # 每阶段插入的标记数量
+        insertion_prob: float = 1.0,                  # 在候选位置实际插入的概率
+        secondary_insertion_prob: float = 0.0,        # 连续插入第二个 <thinking> 的概率
         seed: Optional[int] = None,
     ) -> None:
 
@@ -51,7 +60,7 @@ class ThinkingTokenStrategy(ABC):
     def _candidate_indices(
         self, sample: Dict[str, Any]
     ) -> List[int]:
-        """Return candidate indices (0-based) for inserting thinking tokens."""
+        """返回候选插入位置的索引列表（0-based）。"""
 
     def _build_rng(
         self, sample: Dict[str, Any], scheduled_stage: int = 1
@@ -97,13 +106,18 @@ class ThinkingTokenStrategy(ABC):
         scheduled_stage: int = 1,
         candidate_indices: Optional[List[int]] = None,
     ) -> Tuple[List[int], List[int]]:
+        """
+        在候选位置插入 <thinking> 标记，构建混合序列（文本标记与潜在标记交替）。
+        对应论文4.2节的数据构建过程。
+        返回: (插入 <thinking> 后的 token 序列, 插入位置列表)
+        """
 
         response = sample.get("response_tokenized", [])
         input_tokens = sample.get("question_tokenized", [])
         if len(response) == 0:
             return response, []
         rng = self._build_rng(sample, scheduled_stage)
-        # default to global positions.
+        ## 使用预计算的候选索引（ConfidenceThinkingStrategy 批量处理时传入）
         if candidate_indices is not None:
             candidates = candidate_indices
         else:
@@ -115,10 +129,12 @@ class ThinkingTokenStrategy(ABC):
         if not selected:
             return sample.get("full_tokenized", []), []
 
+        ## 在选定的候选位置逐一插入 <thinking> 标记
         inserted_positions: List[int] = []
         offset = 0
         updated_input_ids = list(sample.get("full_tokenized", []))
         for idx in selected:
+            ## 以 insertion_prob 的概率决定是否在此位置实际插入
             if rng.random() > self.insertion_prob:
                 continue
             if idx < len(input_tokens):
@@ -129,10 +145,13 @@ class ThinkingTokenStrategy(ABC):
             if insert_at < 0:
                 insert_at = 0
 
+            ## 插入一个 <thinking> 标记
             updated_input_ids.insert(insert_at, self.thinking_token_id)
             inserted_positions.append(insert_at)
             offset += 1
 
+            ## 以 secondary_insertion_prob 的概率在同一位置连续插入第二个 <thinking>
+            ## 这允许模型在特别困难的位置进行更多步的潜在推理
             if (
                 self.secondary_insertion_prob > 0.0
                 and rng.random() < self.secondary_insertion_prob
@@ -211,17 +230,24 @@ class ArithmeticThinkingStrategy(ThinkingTokenStrategy):
 
 
 class ConfidenceThinkingStrategy(ThinkingTokenStrategy):
+    """
+    【论文4.2节 - 基于置信度的数据构建】
+    对应论文公式(5):
+      若 p_θ(y_t | y_{<t}) < τ，则在位置 t 插入 <thinking> 占位符
+    该策略通过模型前向传播计算每个位置的预测置信度，
+    在低置信度位置（模型不确定的地方）插入 <thinking> 标记。
+    """
 
     def __init__(
         self,
         tokenizer: PreTrainedTokenizerBase,
         thinking_token_id: int,
-        model: Optional[torch.nn.Module],
+        model: Optional[torch.nn.Module],         # 用于计算置信度的模型实例
         tokens_per_stage: Union[float, int] = 1,
         insertion_prob: float = 1.0,
         secondary_insertion_prob: float = 0.0,
         seed: Optional[int] = None,
-        probability_threshold: float = 0.05,
+        probability_threshold: float = 0.05,       # 论文公式(5)中的阈值 τ
         max_sequence_length: int = 2048,
     ) -> None:
 
@@ -241,19 +267,25 @@ class ConfidenceThinkingStrategy(ThinkingTokenStrategy):
 
         self.model = model
         self.model_device = next(model.parameters()).device
+        ## 论文公式(5)中的置信度阈值 τ
         self.threshold = float(max(min(probability_threshold, 1.0), 0.0))
         self.max_sequence_length = max_sequence_length
+        ## 需要串行处理，因为依赖 GPU 推理计算置信度
         self.requires_serial_processing = True
 
     def batch_candidate_indices(
         self, samples: List[Dict[str, Any]]
     ) -> List[List[int]]:
-        """Process a batch of samples to find candidate indices for thinking token insertion."""
+        """
+        【论文公式(5)的核心实现 - 批量计算候选插入位置】
+        对一批样本进行前向传播，计算每个位置的预测概率 p_θ(y_t | y_{<t})，
+        找出概率低于阈值 τ 的位置作为 <thinking> 插入候选位置。
+        """
         
         if not samples:
             return []
         
-        # Prepare batch data
+        ## 构建 batch 输入：将问题和完整回答（推理链+答案）拼接为对话格式
         batch_messages = [
             [
                 {"role": "user", "content": sample["question"]},
@@ -276,24 +308,27 @@ class ConfidenceThinkingStrategy(ThinkingTokenStrategy):
             "attention_mask": (padded_sequences != self.tokenizer.pad_token_id).long().to(self.model_device),
         }
         
+        ## 使用基础模型进行前向传播，获取每个位置的 logits
         with torch.no_grad():
             self.model.eval()
             outputs = self.model(**batch_input)
             logits = outputs.logits  # Shape: (batch_size, seq_len, vocab_size)
         
-        # Process each sequence in the batch
+        ## 逐样本处理，计算每个位置的预测置信度
         all_candidates = [[] for _ in range(len(samples))]
         for idx, sample in enumerate(samples):
-            # Get actual sequence length from tokenized input
+            ## 计算问题部分的长度，<thinking> 只插入在回答(response)区域
             user_msg = [{"role": "user", "content": sample["question"]}]
             user_text = apply_chat_template_if_needed(self.tokenizer, user_msg)
             question_tokens = self.tokenizer.encode(user_text, add_special_tokens=False)
             question_len = len(question_tokens)
-            # Compute probabilities of the ground-truth next tokens
+            ## 计算每个位置对真实下一个标记的预测概率 p_θ(y_t | y_{<t})
             next_tokens = batch_input_ids[idx][1:].to(self.model_device)
             log_probs = F.log_softmax(logits[idx, : len(batch_input_ids[idx]), :], dim=-1)
             token_log_probs = log_probs.gather(1, next_tokens.unsqueeze(-1)).squeeze(-1)
             token_probs = token_log_probs.exp().tolist()
+            ## 论文公式(5): 若 p_θ(y_t | y_{<t}) < τ，则标记为低置信度位置
+            ## 只在回答区域（question_len 之后）检查，不在问题区域插入
             for pos in range(question_len, len(batch_input_ids[idx])):
                 if token_probs[pos - 1] < self.threshold:
                     all_candidates[idx].append(pos)
@@ -314,6 +349,10 @@ def build_thinking_strategy(
     thinking_token_id: int,
     model: Optional[torch.nn.Module] = None,
 ) -> ThinkingTokenStrategy:
+    """
+    根据配置构建 <thinking> 标记插入策略。
+    论文默认使用 'confidence'（置信度策略），对应论文4.2节的公式(5)。
+    """
 
     strategy_name = getattr(configs, "thinking_strategy", "random").lower()
     tokens_per_stage = getattr(
@@ -569,7 +608,13 @@ def get_cot_latent_dataset(
     return_text: bool = False,
     debug_num: Optional[int] = None,
 ):
-    """Generate CoT latent dataset with tokenization."""
+    """
+    构建 CoT + 潜在标记的训练数据集。
+    对应论文4.2节的"基于置信度的数据构建"：
+      - 阶段0 (common): 仅使用显式 CoT 数据（不插入 <thinking>）
+      - 阶段1/2: 使用 strategy 在低置信度位置插入 <thinking>，
+        构建混合序列（文本标记与潜在标记交替出现）
+    """
     thinking_answer_prob = getattr(configs, "thinking_answer_prob", 0.0)
     thinking_answer_extra_prob = getattr(
         configs, "thinking_answer_extra_prob", 0.0
@@ -584,6 +629,8 @@ def get_cot_latent_dataset(
         base_dataset = base_dataset.select(range(debug_num))
 
     def process_dataset(sample, candidate_indices=None, strategy=None):
+        """处理单个样本：构建 CoT 格式文本，分词后根据策略插入 <thinking> 标记"""
+        ## 将推理链格式化为分步格式
         reasoning_list = sample['reasoning_chain'].split('\n')
         full_response = ""
         for idx in range(len(reasoning_list)):
@@ -591,27 +638,24 @@ def get_cot_latent_dataset(
 
         full_response += f"The final answer is:\n### {sample['answer']}"
         
+        ## 构建对话格式: [用户问题, 助手回答(推理链+答案)]
         messages = [
             {"role": "user", "content": sample["question"]},
             {"role": "assistant", "content": full_response}
         ]
         
-        # Apply chat template if available, returns formatted text string
+        ## 应用聊天模板并分词
         formatted_text = apply_chat_template_if_needed(tokenizer, messages)
-        
-        # Tokenize the formatted text
         full_tokenized = tokenizer.encode(formatted_text, add_special_tokens=False)
         
-        # Find where assistant response starts by tokenizing user part only
+        ## 计算用户问题部分的 token 长度，用于确定 labels 中哪些位置设为 -100（不计算损失）
         user_messages = [{"role": "user", "content": sample["question"]}]
         user_formatted = apply_chat_template_if_needed(tokenizer, user_messages)
         user_tokenized = tokenizer.encode(user_formatted, add_special_tokens=False)
         question_length = len(user_tokenized)
 
-        # Extract question and response tokens from full sequence
         question_tokenized = full_tokenized[:question_length]
 
-        # Create a tokenized sample for strategy processing
         tokenized_sample = {
             'question': sample["question"],
             'reasoning_chain': sample['reasoning_chain'],
@@ -625,14 +669,20 @@ def get_cot_latent_dataset(
         response_tokens = list(tokenized_sample["response_tokenized"])
         thinking_positions: List[int] = []
         
+        ## 【关键步骤】根据策略在低置信度位置插入 <thinking> 标记
+        ## 阶段0: strategy=None，不插入任何 <thinking>（纯 CoT 训练）
+        ## 阶段1/2: 使用 ConfidenceThinkingStrategy 在 p_θ(y_t|y_{<t}) < τ 的位置插入
         if strategy is not None:
             decorated_input_ids, inserted_positions = strategy.apply(tokenized_sample, candidate_indices=candidate_indices)
             thinking_positions = inserted_positions
         else:
             decorated_input_ids = full_tokenized
-        # add eot
+        ## 添加结束标记
         tokens = decorated_input_ids + [tokenizer.eos_token_id]
 
+        ## 构建 labels：问题部分设为 -100（不计算损失），只对回答部分计算损失
+        ## 注意：<thinking> 位置的 label 是其后的正常文本标记，
+        ## 这迫使模型在潜在空间中推理以正确预测下一个显式标记
         labels = (
             [-100] * len(question_tokens)
             + tokens[len(question_tokens):]
@@ -679,12 +729,12 @@ def get_cot_latent_dataset(
             "thinking_positions": thinking_positions if thinking_positions else None,
         }
 
-    # Use multiprocessing for common stage (no CUDA), disable for stages requiring serial processing with CUDA
-    # For "pause" stage_type, we want to use strategy even though mode is "common"
+    ## 阶段0 (common)：不需要 GPU 推理，可并行处理；阶段1/2 使用置信度策略需要串行 GPU 推理
     if configs.current_stage_mode == "common" and stage_type != "pause" and strategy is None:
         map_num_proc = 32
         process_dataset = partial(process_dataset, strategy=None)
     elif strategy is not None and strategy.requires_serial_processing:
+        ## ConfidenceThinkingStrategy 需要 GPU 推理，只能串行处理
         map_num_proc = None
         process_dataset = partial(process_dataset, strategy=strategy)
     else:
@@ -693,6 +743,7 @@ def get_cot_latent_dataset(
         
     print(f"Starting dataset processing for stage: {stage_type} with map_num_proc={map_num_proc}")
     if map_num_proc is not None:
+        ## 并行模式：阶段0 或不需要 GPU 的策略，使用 HuggingFace datasets 的 map 并行处理
         print("Using map function for dataset processing.")
         if get_rank() == 0:
             processed_dataset = base_dataset.map(
@@ -710,6 +761,8 @@ def get_cot_latent_dataset(
             dist.broadcast_object_list(processed_dataset, src=0)
         dataset = processed_dataset[0]
     else:
+        ## 串行模式：阶段1/2 使用 ConfidenceThinkingStrategy，
+        ## 需要批量前向传播计算置信度，然后根据结果插入 <thinking>
         batch_size = configs.batch_size_eval if hasattr(configs, "batch_size_eval") else 8
         batch_start = 0
         print(f"Processing dataset in batches of size {batch_size} for stage: {stage_type}")
@@ -722,9 +775,9 @@ def get_cot_latent_dataset(
             batch_samples = [
                 base_dataset[i] for i in range(batch_start, batch_end)
             ]
-            # if stage_type not in ["common", "explicit"]:
-                    # import pdb; pdb.set_trace()
+            ## 批量计算每个样本中低置信度位置（论文公式5）
             candidate_indices = strategy.batch_candidate_indices(batch_samples)
+            ## 在低置信度位置插入 <thinking> 标记
             for i, sample in enumerate(batch_samples):
                 processed_sample = process_dataset(
                     sample, candidate_indices=candidate_indices[i]

@@ -13,6 +13,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from transformers.models.gpt2 import GPT2LMHeadModel
 import gc
 from safetensors.torch import load_file
+## 模型输出的命名元组，包含: 损失、输入嵌入、logits、KV缓存、最后一层隐藏状态、注意力权重
 Outputs = namedtuple(
     "Outputs", ["loss", "inputs_embeds", "logits", "past_key_values", "last_hidden_state", "attentions"]
 )
@@ -20,6 +21,13 @@ MAX_THINKING_AUTOREGRESS = 32
 
 
 class LT_Tuning_Model(nn.Module):
+    """
+    潜在思维调优（Latent Thoughts Tuning）模型。
+    该模型包装了一个基础因果语言模型，通过三阶段课程学习实现潜在推理：
+      - 阶段0 (common): 显式CoT推理预热，标准SFT训练（对应论文4.1节）
+      - 阶段1 (hidden_state): 动态潜在标记生成，用隐藏状态替代<thinking>的嵌入（对应论文4.2节）
+      - 阶段2 (soft_fusion): 上下文-预测融合，融合隐藏状态与预测分布的嵌入（对应论文4.3节）
+    """
 
     def __init__(
         self,
@@ -29,22 +37,24 @@ class LT_Tuning_Model(nn.Module):
         use_thinking_mlp: bool = False,
         mlp_hidden_dim: Optional[int] = None,
         mlp_activation: str = "gelu",
-        hidden_state_layer_index: int = -1,
-        stage_mode: str = "explicit",  # explicit, hidden_state, soft_fusion
-        fusion_alpha: float = 0.6,  # weight for hidden state in soft fusion
-        fusion_top_p: float = 0.9,  # top-p threshold for token selection
-        fusion_temperature: float = 1.0,  # temperature for softmax
+        hidden_state_layer_index: int = -1,       # 论文中的第I层，用于提取隐藏状态 h_{t-1,I}
+        stage_mode: str = "explicit",              # 当前阶段模式: explicit/common, hidden_state, soft_fusion
+        fusion_alpha: float = 0.6,                 # 论文公式(7)中的 α，平衡隐藏状态与预测嵌入
+        fusion_top_p: float = 0.9,                 # 论文公式(6)中 Top-p 过滤的阈值
+        fusion_temperature: float = 1.0,           # 论文公式(6)中 logits 的温度缩放参数
         **kwargs,
     ):
         super().__init__()
+        ## 基础因果语言模型（如 Llama-3.2-1B）
         self.base_causallm = base_causallm
-        # tested with GPT2 and Llama3
+        # 获取嵌入层和语言模型头，兼容 GPT2 和 Llama 架构
         if isinstance(self.base_causallm, GPT2LMHeadModel):
             self.embedding = self.base_causallm.transformer.get_input_embeddings()
             self.lm_head = self.base_causallm.lm_head
         else:
             self.embedding = self.base_causallm.get_input_embeddings()
             self.lm_head = self.base_causallm.lm_head
+        ## <thinking> 标记的 token ID，用于标识潜在推理位置
         self.thinking_token_id = thinking_token_id
         self.eos_token_id = eos_token_id
         self.gen_forward_cnt = 0
@@ -52,16 +62,18 @@ class LT_Tuning_Model(nn.Module):
         self.use_thinking_mlp = use_thinking_mlp
         self.mlp_hidden_dim = mlp_hidden_dim
         self.mlp_activation = mlp_activation
+        ## 论文中的第 I 层索引，用于提取 h_{t-1,I}（默认 -1 表示最后一层）
         self.hidden_state_layer_index = hidden_state_layer_index
         
-        # Stage control
+        ## 当前训练阶段模式，对应论文三阶段课程学习
         self.stage_mode = stage_mode
-        # Use register_buffer for fusion_alpha to avoid meta device issues
-        # It's not a learnable parameter anyway
+        ## 论文公式(7)中的 α 系数，用 register_buffer 避免设备不匹配问题
         self.register_buffer("fusion_alpha", torch.tensor(fusion_alpha))
+        ## 论文中 Top-p 过滤阈值和温度缩放参数
         self.fusion_top_p = fusion_top_p
         self.fusion_temperature = fusion_temperature
 
+        ## 可选的 MLP 变换层，用于对 <thinking> 嵌入进行非线性变换
         if self.use_thinking_mlp:
             input_dim = self.embedding.embedding_dim
             hidden_dim = self.mlp_hidden_dim or input_dim
@@ -299,40 +311,49 @@ class LT_Tuning_Model(nn.Module):
         raise ValueError(f"Unsupported activation for thinking MLP: {name}")
 
     def _apply_transform(self, hidden_state: torch.Tensor) -> torch.Tensor:
+        """对隐藏状态应用可选的 MLP 变换（论文中未强调但代码支持的可选扩展）"""
         if self.use_thinking_mlp and self.thinking_mlp is not None:
             return self.thinking_mlp(hidden_state)
         return hidden_state
     
     def _soft_fusion_embedding(self, hidden_state: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
-        """Fuse hidden state with top-p sampled token embeddings."""
-        # Apply temperature scaling
+        """
+        【论文4.3节 - 上下文-预测融合】
+        将隐藏状态 h_{t-1,I} 与预测分布加权嵌入 e_pred 进行融合。
+        对应论文公式(6)和(7):
+          e_pred = Σ_{w∈V} P̂(w) · E(w)          ... 公式(6)
+          e_fusion = α · h_{t-1,I} + (1-α) · e_pred  ... 公式(7)
+        """
+        ## 论文公式(6)的温度缩放: 对 logits 进行温度缩放以聚焦高置信度预测
         scaled_logits = logits / self.fusion_temperature
         
-        # Mask out thinking token from distribution
+        ## 屏蔽 <thinking> 标记，防止其参与预测分布（论文4.3节要求）
         masked_logits = scaled_logits.clone()
         masked_logits[self.thinking_token_id] = float('-inf')
         
-        # Compute softmax probabilities
+        ## 计算 softmax 概率分布 P(w)
         probs = torch.softmax(masked_logits, dim=-1)
         
-        # Apply top-p filtering
+        ## 论文公式(6): 应用 Top-p 过滤，只保留累积概率不超过 top_p 的高置信度标记
         sorted_probs, sorted_indices = torch.sort(probs, descending=True)
         cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
         
-        # Find cutoff for top-p
+        ## 找到 Top-p 的截断位置
         cutoff_mask = cumsum_probs <= self.fusion_top_p
-        if cutoff_mask.sum() == 0:  # Include at least one token
+        if cutoff_mask.sum() == 0:  # 至少保留一个标记
             cutoff_mask[0] = True
         
-        # Zero out probabilities below threshold
+        ## Top-p 过滤后重新归一化概率，得到 P̂(w)
         filtered_probs = torch.zeros_like(probs)
         filtered_probs[sorted_indices[cutoff_mask]] = sorted_probs[cutoff_mask]
-        filtered_probs = filtered_probs / filtered_probs.sum()  # Renormalize
+        filtered_probs = filtered_probs / filtered_probs.sum()
         
-        # Weighted sum of embeddings
+        ## 论文公式(6): 计算预测分量 e_pred = Σ P̂(w) · E(w)
+        ## 将过滤后的概率分布投影到嵌入流形上，得到加权嵌入向量
         token_embed_component = filtered_probs @ self.embedding.weight
         
-        # Combine with hidden state using fusion_alpha
+        ## 论文公式(7): 上下文-预测融合 e_fusion = α · h_{t-1,I} + (1-α) · e_pred
+        ## α 平衡隐藏状态（上下文历史）与预测嵌入（模型预测分布）
         alpha = self.fusion_alpha.item()
         fused_embed = alpha * hidden_state + (1 - alpha) * token_embed_component
         
@@ -367,6 +388,7 @@ class LT_Tuning_Model(nn.Module):
             return stats
 
     def _select_hidden_state(self, hidden_states) -> torch.Tensor:
+        """从模型各层隐藏状态中选取第 I 层的隐藏状态 h_{t-1,I}（论文4.2节和4.3节）"""
         index = self.hidden_state_layer_index
         if index is None:
             index = -1
@@ -388,13 +410,20 @@ class LT_Tuning_Model(nn.Module):
         output_attentions = False,
         **kwargs,
     ):
+        """
+        【核心前向传播】
+        将序列按 <thinking> 标记位置切分为多个片段(segment)，依次处理。
+        在每个 <thinking> 位置，根据当前阶段模式(stage_mode)，
+        用前一位置的隐藏状态(或融合嵌入)来替代 <thinking> 的输入嵌入。
+        这是论文方法的核心实现——让 <thinking> 作为不可语言化的潜在推理步骤。
+        """
         batch_size, seq_len = input_ids.shape
 
         embed_dim = self.embedding.embedding_dim
         
-        # Storage for attention outputs from all segments
         all_attentions = [] if output_attentions else None
 
+        ## 【步骤1】找出 batch 中每个样本的所有 <thinking> 标记位置
         thinking_positions_batch = []
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids, device=input_ids.device)
@@ -411,6 +440,8 @@ class LT_Tuning_Model(nn.Module):
             positions = torch.nonzero(thinking_mask, as_tuple=False).squeeze(-1)
             thinking_positions_batch.append(positions.tolist())
 
+        ## 【步骤2】确定切分边界：在每个 <thinking> 位置处切分序列
+        ## 这样可以先处理 <thinking> 之前的文本标记，获取隐藏状态后再生成 <thinking> 的嵌入
         boundary_positions = set()
         for positions in thinking_positions_batch:
             for pos in positions:
@@ -423,11 +454,14 @@ class LT_Tuning_Model(nn.Module):
         outputs = None
         logits_segments = []
         segment_embeds_accum = []
+        ## 记录每个 batch 样本中尚未处理的 <thinking> 位置
         thinking_sets = [set(lst) for lst in thinking_positions_batch]
+        ## 存储已生成的 <thinking> 替代嵌入，key=(batch_idx, position)
         thinking_replacements = {}
 
         selected_hidden_state = None
 
+        ## 【步骤3】按片段依次处理序列，在 <thinking> 边界处生成潜在嵌入
         for boundary_end in boundary_positions:
             if boundary_end <= current_start:
                 continue
@@ -440,6 +474,7 @@ class LT_Tuning_Model(nn.Module):
             segment_slice = slice(current_start, boundary_end)
             segment_ids = input_ids[:, segment_slice]
 
+            ## 为当前片段构建嵌入矩阵
             segment_embeds = torch.zeros(
                 batch_size,
                 segment_length,
@@ -448,16 +483,19 @@ class LT_Tuning_Model(nn.Module):
                 dtype=self.embedding.weight.dtype,
             )
 
+            ## 逐位置构建嵌入：普通标记用嵌入查表，<thinking> 用之前生成的替代嵌入
             for offset in range(segment_length):
                 absolute_pos = current_start + offset
                 token_column = segment_ids[:, offset]
                 thinking_mask = token_column == self.thinking_token_id
 
+                ## 普通文本标记：直接查嵌入表
                 if (~thinking_mask).any():
                     non_thinking_ids = token_column[~thinking_mask]
                     non_thinking_embeds = self.embedding(non_thinking_ids)
                     segment_embeds[~thinking_mask, offset, :] = non_thinking_embeds
 
+                ## <thinking> 标记：使用之前计算好的替代嵌入（来自上一片段的隐藏状态）
                 if thinking_mask.any():
                     thinking_indices = torch.nonzero(thinking_mask, as_tuple=False).flatten()
                     for batch_idx in thinking_indices.tolist():
@@ -470,12 +508,13 @@ class LT_Tuning_Model(nn.Module):
                         segment_embeds[batch_idx, offset, :] = replacement
                         del thinking_replacements[(batch_idx, absolute_pos)]
 
+            ## 将当前片段送入基础模型，使用 KV 缓存实现增量式前向传播
             if kv_cache is None:
                 outputs = self.base_causallm(
                     inputs_embeds=segment_embeds,
                     attention_mask=attention_mask[:, segment_slice],
                     position_ids=position_ids[:, segment_slice],
-                    output_hidden_states=True,
+                    output_hidden_states=True,   # 需要输出各层隐藏状态以提取 h_{t-1,I}
                     output_attentions=output_attentions,
                     use_cache=True,
                 )
@@ -490,16 +529,18 @@ class LT_Tuning_Model(nn.Module):
                     use_cache=True,
                 )
             
-            # Collect attention weights if requested
             if output_attentions and outputs.attentions is not None:
                 all_attentions.append(outputs.attentions)
 
             logits_segments.append(outputs.logits)
             segment_embeds_accum.append(segment_embeds)
+            ## 从模型输出中提取第 I 层的隐藏状态 h_{t-1,I}（论文4.2/4.3节）
             hidden_states = self._select_hidden_state(outputs.hidden_states)
             selected_hidden_state = hidden_states
             kv_cache = outputs.past_key_values
 
+            ## 【关键步骤】如果下一个位置是 <thinking>，为其生成替代嵌入
+            ## 这是论文方法的核心：根据 stage_mode 决定 <thinking> 标记的输入嵌入
             if boundary_end < seq_len:
                 batch_indices_to_update = [
                     batch_idx
@@ -508,23 +549,31 @@ class LT_Tuning_Model(nn.Module):
                 ]
 
                 if batch_indices_to_update and segment_length > 0:
+                    ## 取当前片段最后一个位置的隐藏状态，即位置 t-1 的 h_{t-1,I}
                     hidden_idx = segment_length - 1
                     for batch_idx in batch_indices_to_update:
                         prev_hidden = hidden_states[batch_idx, hidden_idx, :]
                         
-                        # Stage-specific embedding generation
+                        ## ===== 根据训练阶段选择不同的嵌入生成策略 =====
                         if self.stage_mode == "hidden_state":
-                            # Stage 1: Use hidden state directly (with optional MLP), <thinking> has no embedding
+                            ## 【阶段1 - 论文4.2节】动态潜在标记生成
+                            ## 直接使用位置 t-1 处第 I 层的隐藏状态 h_{t-1,I} 作为 <thinking> 的输入嵌入
+                            ## "确保潜在推理仅保留用于不确定步骤"
                             replacement = self._apply_transform(prev_hidden)
                         elif self.stage_mode == "soft_fusion":
-                            # Stage 2: Fuse hidden state with predicted token embeddings
+                            ## 【阶段2 - 论文4.3节】上下文-预测融合
+                            ## 先获取位置 t-1 的 logit 分布 l_{t-1}
                             prev_logits = outputs.logits[batch_idx, hidden_idx, :]
+                            ## 调用 _soft_fusion_embedding 执行融合：
+                            ## e_fusion = α · h_{t-1,I} + (1-α) · e_pred（公式7）
                             replacement = self._soft_fusion_embedding(prev_hidden, prev_logits)
                             replacement = self._apply_transform(replacement)
                         else:
-                            # Stage 0 (explicit) or default: normal hidden state
+                            ## 【阶段0 - 论文4.1节】显式推理预热（common 模式）
+                            ## 此阶段通常不插入 <thinking> 标记，若意外出现则用隐藏状态替代
                             replacement = self._apply_transform(prev_hidden)
                         
+                        ## 将生成的替代嵌入存入字典，供下一片段处理 <thinking> 位置时使用
                         thinking_replacements[(batch_idx, boundary_end)] = replacement
                         thinking_sets[batch_idx].remove(boundary_end)
 
@@ -533,6 +582,7 @@ class LT_Tuning_Model(nn.Module):
         if outputs is None:
             raise RuntimeError("No forward pass executed in LT_Tuning_Model model.")
 
+        ## 【步骤4】拼接所有片段的 logits 和嵌入
         logits = torch.cat(logits_segments, dim=1)
         inputs_embeds = torch.cat(segment_embeds_accum, dim=1)
         self.gen_forward_cnt += len(logits_segments)
@@ -540,6 +590,10 @@ class LT_Tuning_Model(nn.Module):
         del segment_embeds_accum
         gc.collect()
         torch.cuda.empty_cache()
+        ## 【步骤5】计算损失 - 对应论文公式(4): L_CoT = -Σ_t log p_θ(y_t | x, y_{<t})
+        ## 使用标准的自回归交叉熵损失，shift 使 logits[t] 预测 labels[t+1]
+        ## 注意：<thinking> 位置的 labels 是正常的下一个文本标记，
+        ## 这意味着模型需要通过潜在嵌入来预测后续的显式标记
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
@@ -637,19 +691,27 @@ class LT_Tuning_Model(nn.Module):
     def generate(
         self,
         input_ids,
-        attention_mask,  # attention_mask is not used
+        attention_mask,
         max_new_tokens=16,
         output_embedding=False,
         synced_gpus=False,
-        without_thinking_token=False,
+        without_thinking_token=False,     # 若为 True，则禁止模型生成 <thinking> 标记
         **kwargs
     ):
+        """
+        自回归生成方法。
+        关键参数 without_thinking_token:
+          - True: 将 <thinking> 的 logit 设为 -inf，禁止生成 <thinking>（评测时使用）
+          - False: 允许模型自主决定是否生成 <thinking> 进行潜在推理
+        当模型生成 <thinking> 时，会根据 stage_mode 为其构建嵌入（同 forward 逻辑）。
+        """
 
         self.gen_forward_cnt = 0
 
         assert input_ids.shape[0] == 1, "only support batch_size == 1 now"
         tokens = input_ids[0].detach().tolist()
 
+        ## 先对输入序列做一次完整的前向传播，获取 KV 缓存和隐藏状态
         outputs = self.forward(
             input_ids=input_ids,
             attention_mask=torch.ones_like(input_ids, device=input_ids.device),
@@ -662,29 +724,33 @@ class LT_Tuning_Model(nn.Module):
         past_key_values = outputs.past_key_values
         selected_hidden_state = outputs.last_hidden_state
 
-        # get the first token using the current hidden state
+        ## 如果禁用 thinking，将 <thinking> 标记的 logit 设为负无穷，阻止其被选中
         if without_thinking_token:
             outputs.logits[0, -1, self.thinking_token_id] = float('-inf')
 
+        ## 贪心解码：选择概率最大的 token
         next_token = torch.argmax(outputs.logits[0, -1]).item()
         tokens.append(next_token)
+        ## 如果生成了 <thinking> 标记，需要根据阶段模式构建其嵌入
         if next_token == self.thinking_token_id:
             prev_hidden = selected_hidden_state[:, -1, :]
             if self.stage_mode == "soft_fusion":
+                ## 阶段2: 上下文-预测融合
                 prev_logits = outputs.logits[0, -1, :]
                 fused = self._soft_fusion_embedding(prev_hidden, prev_logits)
                 new_token_embed = self._apply_transform(fused).unsqueeze(1)
             else:
-                # hidden_state mode or default: use hidden state as embedding
+                ## 阶段1: 直接使用隐藏状态作为嵌入
                 new_token_embed = self._apply_transform(prev_hidden).unsqueeze(1)
         else:
+            ## 普通文本标记：直接查嵌入表
             new_token_embed = self.embedding(
                 torch.tensor(next_token, device=input_ids.device)
             ).view(1, 1, -1)
 
         new_inputs_embeds = torch.cat((inputs_embeds, new_token_embed), dim=1)
 
-        # get other tokens
+        ## 自回归循环生成后续标记
         for _ in range(max_new_tokens - 1):
             outputs = self.base_causallm(
                 inputs_embeds=new_token_embed,
@@ -701,6 +767,7 @@ class LT_Tuning_Model(nn.Module):
             tokens.append(next_token)
             past_key_values = outputs.past_key_values
             selected_hidden_state = self._select_hidden_state(outputs.hidden_states)
+            ## 同理：如果生成 <thinking>，根据阶段模式构建嵌入
             if next_token == self.thinking_token_id:
                 prev_hidden = selected_hidden_state[:, -1, :]
                 if self.stage_mode == "soft_fusion":
@@ -708,7 +775,6 @@ class LT_Tuning_Model(nn.Module):
                     fused = self._soft_fusion_embedding(prev_hidden, prev_logits)
                     new_token_embed = self._apply_transform(fused).unsqueeze(1)
                 else:
-                    # hidden_state mode or default: use hidden state as embedding
                     new_token_embed = self._apply_transform(prev_hidden).unsqueeze(1)
             else:
                 new_token_embed = self.embedding(
