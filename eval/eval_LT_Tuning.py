@@ -17,7 +17,7 @@ _parent_dir = os.path.dirname(_current_dir)
 if _parent_dir not in sys.path:
     sys.path.insert(0, _parent_dir)
 
-from model import SoftSeft
+from model import LT_Tuning_Model
 from utils import Config, set_seed
 from eval.dataset import load_test_dataset, NAME_REPO_MAPPING
 from eval.utils import (
@@ -108,7 +108,7 @@ def gather_results_from_all_ranks(local_results: List[Dict]) -> List[Dict]:
 
 
 def load_model_and_tokenizer(configs: Config, device: torch.device):
-    """Load model and tokenizer using SoftSeft.from_pretrained()."""
+    """Load model and tokenizer using LT_Tuning_Model.from_pretrained()."""
     print_rank_0(f"Loading model from {configs.model_path}")
     # import pdb; pdb.set_trace()
     # Load tokenizer
@@ -188,7 +188,7 @@ def load_model_and_tokenizer(configs: Config, device: torch.device):
     print_rank_0(f"Model loading kwargs: {model_kwargs}")
     
     # Load model using from_pretrained
-    model = SoftSeft.from_pretrained(
+    model = LT_Tuning_Model.from_pretrained(
         model_path=configs.model_path,
         **model_kwargs
     )
