@@ -636,7 +636,7 @@ class GenerationEvalCallback(TrainerCallback):
     
     def on_epoch_end(self, args, state, control, **kwargs):
         """Run distributed generation evaluation at the end of each epoch."""
-        return control # TEMP DISABLE
+        # return control # TEMP DISABLE
         epoch = int(state.epoch) if state.epoch else 0
         total_epochs = int(args.num_train_epochs) if args.num_train_epochs else 1
         is_final_epoch = (epoch >= total_epochs)
