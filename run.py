@@ -140,9 +140,17 @@ def parse_args_from_yaml(config_path: str):
         else:
             custom_dict[k] = v
     
+    # Handle custom eval_strategy values (HF only accepts no/steps/epoch)
+    _custom_eval_strategy = training_dict.get("eval_strategy", "no")
+    if _custom_eval_strategy not in ("no", "steps", "epoch"):
+        training_dict["eval_strategy"] = "no"
+    
     # Use HfArgumentParser for proper parsing
     parser = HfArgumentParser((CustomizedArguments, LTTuningTrainingArguments))
     custom_args, training_args = parser.parse_dict({**custom_dict, **training_dict}, allow_extra_keys=True)
+    
+    # Store original eval strategy in a separate attribute (HF's field stays valid)
+    training_args._generation_eval_strategy = _custom_eval_strategy
     
     # Set output_dir from custom args
     training_args.output_dir = os.path.join(custom_args.save_path, custom_args.name)
@@ -1101,16 +1109,16 @@ def main():
     callbacks = [stage_callback, wandb_callback]
     # Generation evaluation callback
     # eval_strategy: 'no' → final_only, 'epoch' → every epoch, 'stage' → at stage boundaries
-    if training_args.eval_strategy == "no":
+    _gen_eval = getattr(training_args, '_generation_eval_strategy', str(training_args.eval_strategy))
+    if _gen_eval == "stage":
+        evaluation_strategy = 'stage'
+        print_rank_0(f"eval_strategy is 'stage' → will evaluate at stage boundaries: epochs {stage_manager.stage_boundary_epochs}")
+    elif _gen_eval == "no":
         evaluation_strategy = 'final_only'
         print_rank_0("eval_strategy is 'no' → final_only: will evaluate only at final epoch")
-    elif training_args.eval_strategy == "stage":
-        evaluation_strategy = 'stage'
-        training_args.eval_strategy = "no"  # HF Trainer doesn't know 'stage', disable its built-in eval
-        print_rank_0(f"eval_strategy is 'stage' → will evaluate at stage boundaries: epochs {stage_manager.stage_boundary_epochs}")
     else:
         evaluation_strategy = 'epoch'
-        print_rank_0(f"eval_strategy is '{training_args.eval_strategy}' → will evaluate every epoch")
+        print_rank_0(f"eval_strategy is '{_gen_eval}' → will evaluate every epoch")
     
     eval_callback = GenerationEvalCallback(
         model=model,
