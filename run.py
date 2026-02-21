@@ -643,8 +643,11 @@ class GenerationEvalCallback(TrainerCallback):
         
         # Check if we should run evaluation based on strategy
         if self.evaluation_strategy == 'final_only' and not is_final_epoch:
-            # Skip evaluation if not final epoch
             return control
+        elif self.evaluation_strategy == 'stage':
+            stage_boundaries = self.stage_manager.stage_boundary_epochs
+            if epoch not in stage_boundaries and not is_final_epoch:
+                return control
         
         print_rank_0(f"\n===== Generation Evaluation (Epoch {epoch}/{total_epochs}) =====")
         begin_time = time()
@@ -1097,14 +1100,17 @@ def main():
     )
     callbacks = [stage_callback, wandb_callback]
     # Generation evaluation callback
-    # If eval_strategy is 'no', use 'final_only' to evaluate at the end with detailed results
-    # If eval_strategy is 'epoch', evaluate every epoch
+    # eval_strategy: 'no' → final_only, 'epoch' → every epoch, 'stage' → at stage boundaries
     if training_args.eval_strategy == "no":
         evaluation_strategy = 'final_only'
-        print_rank_0("eval_strategy is 'no', using 'final_only' - will evaluate only at final epoch with detailed JSON output")
+        print_rank_0("eval_strategy is 'no' → final_only: will evaluate only at final epoch")
+    elif training_args.eval_strategy == "stage":
+        evaluation_strategy = 'stage'
+        training_args.eval_strategy = "no"  # HF Trainer doesn't know 'stage', disable its built-in eval
+        print_rank_0(f"eval_strategy is 'stage' → will evaluate at stage boundaries: epochs {stage_manager.stage_boundary_epochs}")
     else:
         evaluation_strategy = 'epoch'
-        print_rank_0(f"eval_strategy is '{training_args.eval_strategy}', using 'epoch' - will evaluate every epoch")
+        print_rank_0(f"eval_strategy is '{training_args.eval_strategy}' → will evaluate every epoch")
     
     eval_callback = GenerationEvalCallback(
         model=model,

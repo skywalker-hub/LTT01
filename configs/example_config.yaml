@@ -94,7 +94,7 @@ warmup_ratio: 0.05                          # 学习率预热比例（前 5% 的
 bf16: true                                  # 是否使用 bfloat16 混合精度训练
 logging_steps: 10                           # 每隔多少步打印一次训练日志（loss 等）
 save_strategy: epoch                        # checkpoint 保存策略：epoch / steps / no
-eval_strategy: epoch                        # 评估策略：epoch（每轮评估）/ no（不评估或仅最后评估）
+eval_strategy: stage                        # 评估策略：stage（每阶段结束评估）/ epoch（每轮评估）/ no（仅最后评估）
 report_to: wandb                            # 日志上报平台：wandb / tensorboard / none
 seed: 42                                    # 随机种子（控制数据 shuffle、模型初始化等）
 datasets:                                   # 数据集标识（当前未在代码中实际使用）

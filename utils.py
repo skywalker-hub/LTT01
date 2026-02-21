@@ -221,6 +221,18 @@ class StageManager:
 
         return label, stage_mode, tokens_cap, insertion
 
+    @property
+    def stage_boundary_epochs(self):
+        """Return 1-based epoch numbers where each stage ends.
+        E.g. stage_epochs=[3,1,3] → [3, 4, 7]
+        """
+        boundaries = []
+        cumsum = 0
+        for duration in self.stage_epochs:
+            cumsum += duration
+            boundaries.append(cumsum)
+        return boundaries
+
     def update_for_epoch(self, epoch_idx: int) -> bool:
         desired = self.stage_for_epoch(epoch_idx)
         if desired != self.stage_idx:
