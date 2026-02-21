@@ -75,7 +75,7 @@ warmup_ratio: 0.05
 bf16: true
 logging_steps: 10
 save_strategy: epoch
-eval_strategy: 'no'
+eval_strategy: epoch
 report_to: wandb
 seed: 42
 datasets:
