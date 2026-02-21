@@ -19,9 +19,9 @@ no_thoughts: false                          # true = 完全禁用 <thinking> 机
 
 # ==================== 三阶段课程学习 ====================
 stage_epochs:                               # 每个阶段持续的 epoch 数（总和须等于 num_train_epochs）
-- 1                                         #   stage0: 显式 CoT 预热
+- 3                                         #   stage0: 显式 CoT 预热
 - 1                                         #   stage1: 隐藏状态嵌入
-- 1                                         #   stage2: 上下文-预测融合
+- 3                                         #   stage2: 上下文-预测融合
 labels_per_stage:                           # 每个阶段中参与 loss 计算的 <thinking> 标记数量
 - 0                                         #   stage0: 不插入 <thinking>，无需计算
 - 10                                        #   stage1: 10 个
@@ -85,7 +85,7 @@ output_dir: models/example_exp              # HF Trainer 的输出目录（会�
 per_device_train_batch_size: 4              # 每张 GPU 的训练 batch size
 per_device_eval_batch_size: 4               # 每张 GPU 的评估 batch size
 gradient_accumulation_steps: 1              # 梯度累积步数（等效 batch = batch_size × GPU数 × 此值）
-num_train_epochs: 3                         # 总训练 epoch 数（须等于 stage_epochs 之和）
+num_train_epochs: 7                         # 总训练 epoch 数（须等于 stage_epochs 之和）
 save_total_limit: 2                         # HF Trainer 最多保留的 checkpoint 数量
 remove_unused_columns: true                 # 是否自动移除模型不需要的数据列
 learning_rate: 5.0e-05                      # 学习率
