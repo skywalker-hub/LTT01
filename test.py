@@ -12,7 +12,7 @@ from eval.utils import extract_answer_from_output, apply_chat_template_if_needed
 # ==================== 可修改配置区 ====================
 
 # 要测试的问题（修改这里即可）
-QUESTION = "Carlos is planting a lemon tree. The tree will cost $90 to plant. Each year it will grow 7 lemons, which he can sell for $1.5 each. It costs $3 a year to water and feed the tree. How many years will it take before he starts earning money on the lemon tree?" 
+QUESTION = "Janet\u2019s ducks lay 16 eggs per day. She eats three for breakfast every morning and bakes muffins for her friends every day with four. She sells the remainder at the farmers' market daily for $2 per fresh duck egg. How much in dollars does she make every day at the farmers' market?"
 
 # 训练好的模型路径（DeepSpeed/HF 保存的 checkpoint 目录）
 MODEL_PATH = "models/example"
