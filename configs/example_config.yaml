@@ -8,7 +8,7 @@ train_path: data/gsm8k/train_socratic.jsonl # 训练数据文件路径
 val_path: data/gsm8k/test_socratic.jsonl    # 验证数据文件路径
 
 # ==================== 模型 ====================
-model_name_or_path: ../Llama-3.2-1B         # 基础模型路径（HuggingFace 格式）
+model_name_or_path: ../Llama-3.2-1B-Instruct # 基础模型路径（HuggingFace 格式）
 load_model_path: null                       # 加载已有 checkpoint 的路径（null = 从头训）
 use_flash_attention: true                   # 是否使用 Flash Attention 2 加速注意力计算
 

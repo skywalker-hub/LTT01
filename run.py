@@ -45,7 +45,7 @@ class CustomizedArguments:
     val_path: str = field(default="data/gsm_test.json")
     
     # Model
-    model_name_or_path: str = field(default="meta-llama/Llama-3.2-1B")
+    model_name_or_path: str = field(default="meta-llama/Llama-3.2-1B-Instruct")
     load_model_path: Optional[str] = field(default=None)
     use_flash_attention: bool = field(default=True)
     
@@ -704,18 +704,25 @@ class GenerationEvalCallback(TrainerCallback):
                 input_ids = torch.tensor([sample["input_ids"]], device=device)
                 attention_mask = torch.tensor([sample["attention_mask"]], device=device)
                 
-                # Generate
+                # Generate — use all eos_token_ids to handle Instruct models
+                # that stop with <|eot_id|> in addition to <|end_of_text|>
+                eos_ids = self.tokenizer.eos_token_id
+                if hasattr(self.tokenizer, "eos_token_id") and isinstance(eos_ids, int):
+                    eot_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
+                    if eot_id is not None and eot_id != self.tokenizer.unk_token_id:
+                        eos_ids = [eos_ids, eot_id]
                 outputs = unwrapped.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     max_new_tokens=self.max_new_tokens,
                     pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
+                    eos_token_id=eos_ids,
                 )
                 
-                # Decode and extract answer
-                text_output = self.tokenizer.decode(outputs[0], skip_special_tokens=False)
-                if "<thinking>" in text_output:
+                # Decode: keep special tokens for <thinking> detection, then clean for answer extraction
+                text_output_raw = self.tokenizer.decode(outputs[0], skip_special_tokens=False)
+                text_output = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+                if "<thinking>" in text_output_raw:
                     print_rank_0(f"[Rank {rank}] Info: '<thinking>' token found in output for sample {idx}")
                 # Extract answer after "####"
                 answer_output = text_output.split("####")[-1].replace(",", "").replace("<thinking>", "").strip()
@@ -741,7 +748,7 @@ class GenerationEvalCallback(TrainerCallback):
                         "is_correct": is_correct,
                         "input_text": input_text,
                         "input_token_ids": input_ids[0].tolist(),
-                        "output_text": text_output,
+                        "output_text": text_output_raw,
                         "output_token_ids": outputs[0].tolist(),
                         "generated_token_ids": output_tokens,
                         "rank": rank,
