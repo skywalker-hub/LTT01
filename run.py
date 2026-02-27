@@ -719,13 +719,15 @@ class GenerationEvalCallback(TrainerCallback):
                     eos_token_id=eos_ids,
                 )
                 
-                # Decode: keep special tokens for <thinking> detection, then clean for answer extraction
-                text_output_raw = self.tokenizer.decode(outputs[0], skip_special_tokens=False)
-                text_output = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-                if "<thinking>" in text_output_raw:
+                # Decode only the generated part (exclude prompt tokens)
+                prompt_len = len(input_ids[0])
+                generated_ids = outputs[0][prompt_len:]
+                gen_text_raw = self.tokenizer.decode(generated_ids, skip_special_tokens=False)
+                gen_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+                if "<thinking>" in gen_text_raw:
                     print_rank_0(f"[Rank {rank}] Info: '<thinking>' token found in output for sample {idx}")
                 # Extract answer after "####"
-                answer_output = text_output.split("####")[-1].replace(",", "").replace("<thinking>", "").strip()
+                answer_output = gen_text.split("####")[-1].replace(",", "").replace("<thinking>", "").strip()
                 
                 # Compare with ground truth
                 gt_answer = self.answers[idx]
@@ -735,10 +737,8 @@ class GenerationEvalCallback(TrainerCallback):
                 
                 # Store detailed result if needed
                 if self.save_detailed_results:
-                    # Get input text
                     input_text = self.tokenizer.decode(input_ids[0], skip_special_tokens=False)
-                    # Get output tokens (only the generated part)
-                    output_tokens = outputs[0][len(input_ids[0]):].tolist()
+                    output_tokens = generated_ids.tolist()
                     
                     detailed_result = {
                         "sample_idx": idx,
@@ -748,7 +748,7 @@ class GenerationEvalCallback(TrainerCallback):
                         "is_correct": is_correct,
                         "input_text": input_text,
                         "input_token_ids": input_ids[0].tolist(),
-                        "output_text": text_output_raw,
+                        "output_text": gen_text_raw,
                         "output_token_ids": outputs[0].tolist(),
                         "generated_token_ids": output_tokens,
                         "rank": rank,
@@ -763,7 +763,7 @@ class GenerationEvalCallback(TrainerCallback):
                 # Print some examples (only rank 0)
                 if rank == 0 and idx < 10:
                     print_rank_0(f"\n[Sample {idx}] GT: '{gt_answer}' | Pred: '{answer_output}'")
-                    print_rank_0(f"Full output: {text_output}")
+                    print_rank_0(f"Generated: {gen_text}")
                 
                 if rank == 0:
                     pbar.set_description(f"[Rank 0] Acc: {local_correct}/{idx - start_idx + 1}")
