@@ -717,8 +717,8 @@ class GenerationEvalCallback(TrainerCallback):
                 text_output = self.tokenizer.decode(outputs[0], skip_special_tokens=False)
                 if "<thinking>" in text_output:
                     print_rank_0(f"[Rank {rank}] Info: '<thinking>' token found in output for sample {idx}")
-                # Extract answer after "###" or "#"
-                answer_output = text_output.split("#")[-1].replace(",", "").replace("<thinking>", "").strip()
+                # Extract answer after "####"
+                answer_output = text_output.split("####")[-1].replace(",", "").replace("<thinking>", "").strip()
                 
                 # Compare with ground truth
                 gt_answer = self.answers[idx]

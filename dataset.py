@@ -14,6 +14,16 @@ from transformers.data.data_collator import pad_without_fast_tokenizer_warning
 from tqdm import tqdm
 from utils import apply_chat_template_if_needed, print_list_in_json
 
+ANSWER_START = "####"
+
+SYSTEM_PROMPT = (
+    "A conversation between User and Assistant. The user asks a question, and "
+    "the assistant solves it. The assistant first thinks about the reasoning "
+    "process in the mind and then provides the user with the answer. The "
+    "final answer is provided after the " + ANSWER_START + " tag, i.e., "
+    "{reasoning process} " + ANSWER_START + " {answer}."
+)
+
 def is_distributed():
     try:
         import torch.distributed as dist
@@ -288,8 +298,9 @@ class ConfidenceThinkingStrategy(ThinkingTokenStrategy):
         ## 构建 batch 输入：将问题和完整回答（推理链+答案）拼接为对话格式
         batch_messages = [
             [
+                {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": sample["question"]},
-                {"role": "assistant", "content": sample["reasoning_chain"] + "\n### " + sample["answer"]}
+                {"role": "assistant", "content": sample["reasoning_chain"] + "\n" + ANSWER_START + " " + sample["answer"]}
             ] for sample in samples
         ]
         batch_input_ids = [
@@ -318,7 +329,10 @@ class ConfidenceThinkingStrategy(ThinkingTokenStrategy):
         all_candidates = [[] for _ in range(len(samples))]
         for idx, sample in enumerate(samples):
             ## 计算问题部分的长度，<thinking> 只插入在回答(response)区域
-            user_msg = [{"role": "user", "content": sample["question"]}]
+            user_msg = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": sample["question"]}
+            ]
             user_text = apply_chat_template_if_needed(self.tokenizer, user_msg)
             question_tokens = self.tokenizer.encode(user_text, add_special_tokens=False)
             question_len = len(question_tokens)
@@ -576,6 +590,10 @@ def get_question_dataset(
         # Apply chat template if available, otherwise use plain text
         message = [
             {
+                "role": "system",
+                "content": SYSTEM_PROMPT,
+            },
+            {
                 "role": "user",
                 "content": sample["question"],
             }
@@ -636,10 +654,11 @@ def get_cot_latent_dataset(
         for idx in range(len(reasoning_list)):
             full_response += f'## Step {idx + 1}: {reasoning_list[idx]}\n'
 
-        full_response += f"The final answer is:\n### {sample['answer']}"
+        full_response += f"{ANSWER_START} {sample['answer']}"
         
-        ## 构建对话格式: [用户问题, 助手回答(推理链+答案)]
+        ## 构建对话格式: [系统提示, 用户问题, 助手回答(推理链+答案)]
         messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": sample["question"]},
             {"role": "assistant", "content": full_response}
         ]
@@ -649,7 +668,10 @@ def get_cot_latent_dataset(
         full_tokenized = tokenizer.encode(formatted_text, add_special_tokens=False)
         
         ## 计算用户问题部分的 token 长度，用于确定 labels 中哪些位置设为 -100（不计算损失）
-        user_messages = [{"role": "user", "content": sample["question"]}]
+        user_messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": sample["question"]}
+        ]
         user_formatted = apply_chat_template_if_needed(tokenizer, user_messages)
         user_tokenized = tokenizer.encode(user_formatted, add_special_tokens=False)
         question_length = len(user_tokenized)
